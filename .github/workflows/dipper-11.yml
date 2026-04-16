@@ -1,0 +1,432 @@
+name: Check and Build
+
+env:
+  kernel_repository: Geeeeeker/android_kernel_xiaomi_sdm845
+  kernel_branch: lineage-18.1
+  device: dipper
+  clang_version: r383902b               # <--- 改回 Android 11 的官方版本
+  defconfig: |
+    arch/arm64/configs/dipper-mi845_defconfig
+  kernel_patch: |
+    allow-init-exec-ksud-under-nosuid.patch
+    backport-path-umount.patch
+  kernelsu_patch: |
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_rebuild:
+        description: "Allow Rebuild"
+        type: boolean
+        default: false
+
+jobs:
+  check_kernelsu_update:
+    name: Check KernelSU update
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check KernelSU version
+        id: check_kernelsu_version
+        run: |
+          local_version=$(curl -L --header 'authorization: Bearer ${{ github.token }}' https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name)
+          # remote_version=$(curl -L https://api.github.com/repos/tiann/KernelSU/releases/latest | jq -r .tag_name)
+          remote_version=v0.9.5
+          echo local_version=$local_version | tee -a $GITHUB_OUTPUT
+          echo remote_version=$remote_version | tee -a $GITHUB_OUTPUT
+    outputs:
+      local_version: ${{ steps.check_kernelsu_version.outputs.local_version }}
+      remote_version: ${{ steps.check_kernelsu_version.outputs.remote_version }}
+
+  build:
+    name: Build kernel
+    needs: check_kernelsu_update
+    if: inputs.allow_rebuild || needs.check_kernelsu_update.outputs.local_version != needs.check_kernelsu_update.outputs.remote_version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Set env
+        run: |
+          echo kernelsu_remote_version=${{ needs.check_kernelsu_update.outputs.remote_version }} | tee -a $GITHUB_ENV
+          if [[ "$clang_version" = "r"* ]] || [[ "$clang_version" = "latest" ]]; then
+              clang_type=aosp
+          else
+              clang_type=vanilla
+          fi
+          echo clang_type=$clang_type | tee -a $GITHUB_ENV
+          if [[ "$clang_version" = "latest" ]]; then
+              clang_version=$(curl -L https://android.googlesource.com/kernel/common/+/refs/heads/android-mainline/build.config.constants | grep -Eo 'r[0-9]{6}[a-z]?[0-9]?')
+              echo clang_version=$clang_version | tee -a $GITHUB_ENV
+          fi
+
+      - name: Install packages
+        run: |
+          sudo apt update
+          sudo apt install -y \
+              binutils-arm-linux-gnueabi \
+              binutils-aarch64-linux-gnu \
+              ccache \
+              flex \
+              bison \
+              libssl-dev \
+              autoconf \
+              libtool \
+              pkg-config \
+              libudev-dev \
+              qemu-user-static \
+              binfmt-support
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.kernel_repository }}
+          ref: ${{ env.kernel_branch }}
+          submodules: recursive
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: this-repo
+          submodules: recursive
+
+      - name: Get latest kernel commit id
+        run: |
+          echo kernel_commit_id=$(git rev-parse HEAD) | tee -a $GITHUB_ENV
+
+      - name: Merge defconfig
+        run: |
+          DEFCONFIG_FILE=""
+          while read -r line; do
+              if [ -z "$line" ] || [[ "$line" == "#"* ]]; then
+                  continue
+              fi
+              echo "Merging defconfig: $line"
+              cat "$line" >> arch/arm64/configs/merged_defconfig
+              DEFCONFIG_FILE="$line"
+          done <<<"$defconfig"
+
+      # ========== 扩展内核配置（融合自第二个工作流） ==========
+      - name: Apply extended kernel configs
+        run: |
+          DEFCONFIG="arch/arm64/configs/merged_defconfig"
+
+          # Kprobes（KernelSU 需要）
+          echo "CONFIG_KPROBES=y" >> $DEFCONFIG
+          echo "CONFIG_HAVE_KPROBES=y" >> $DEFCONFIG
+          echo "CONFIG_KPROBE_EVENTS=y" >> $DEFCONFIG
+
+          # OverlayFS
+          echo "CONFIG_OVERLAY_FS=y" >> $DEFCONFIG
+
+          # 禁用 LTO
+          sed -i 's/CONFIG_LTO=y/CONFIG_LTO=n/' $DEFCONFIG
+          sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_CLANG=n/' $DEFCONFIG
+          sed -i 's/CONFIG_THINLTO=y/CONFIG_THINLTO=n/' $DEFCONFIG
+          echo "CONFIG_LTO_NONE=y" >> $DEFCONFIG
+
+          # 禁用 CC_WERROR
+          echo "CONFIG_CC_WERROR=n" >> $DEFCONFIG
+
+          # 其他特性
+          echo "CONFIG_ASHMEM=y" >> $DEFCONFIG
+          echo "CONFIG_SYSVIPC=y" >> $DEFCONFIG
+          echo "CONFIG_SYSVIPC_SYSCTL=y" >> $DEFCONFIG
+          echo "CONFIG_SYSVIPC_COMPAT=y" >> $DEFCONFIG
+          echo "CONFIG_EPOLL=y" >> $DEFCONFIG
+          echo "CONFIG_EVENTFD=y" >> $DEFCONFIG
+          echo "CONFIG_SIGNALFD=y" >> $DEFCONFIG
+          echo "CONFIG_INOTIFY_USER=y" >> $DEFCONFIG
+          echo "CONFIG_SHMEM=y" >> $DEFCONFIG
+          echo "CONFIG_TMPFS=y" >> $DEFCONFIG
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> $DEFCONFIG
+          echo "CONFIG_TMPFS_XATTR=y" >> $DEFCONFIG
+
+          # USB/IP 模块化
+          echo "CONFIG_USBIP_CORE=m" >> $DEFCONFIG
+          echo "CONFIG_USBIP_VHCI_HCD=m" >> $DEFCONFIG
+          echo "CONFIG_USBIP_HOST=m" >> $DEFCONFIG
+
+          # Backlight
+          echo "CONFIG_BACKLIGHT_CLASS_DEVICE=y" >> $DEFCONFIG
+          echo "CONFIG_BACKLIGHT_QCOM=y" >> $DEFCONFIG
+
+          # zstd 压缩
+          echo "CONFIG_ZRAM=y" >> $DEFCONFIG
+          echo "CONFIG_ZRAM_DEF_COMP_ZSTD=y" >> $DEFCONFIG
+          echo "CONFIG_CRYPTO_ZSTD=y" >> $DEFCONFIG
+
+          # KernelSU 基础选项
+          echo "CONFIG_KERNELSU=y" >> $DEFCONFIG
+          echo "CONFIG_KPM=y" >> $DEFCONFIG
+          echo "CONFIG_KALLSYMS=y" >> $DEFCONFIG
+          echo "CONFIG_KALLSYMS_ALL=y" >> $DEFCONFIG
+
+          # 禁用 MODVERSIONS
+          sed -i 's/CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/' $DEFCONFIG
+          echo "# CONFIG_MODVERSIONS is not set" >> $DEFCONFIG
+
+      # ========== LXC / Docker 支持 ==========
+      - name: Setup LXC and Docker support
+        run: |
+          rm -rf utils
+          git clone https://github.com/tomxi1997/lxc-docker-support-for-android.git utils
+          # 移除强制选中的越权选项
+          sed -i '/select CFS_BANDWIDTH/d' utils/Kconfig
+          sed -i '/select DOCKER_STATISTICS/d' utils/Kconfig
+          sed -i '/select BLK_DEV_THROTTLING/d' utils/Kconfig
+          sed -i '/select CFQ_GROUP_IOSCHED/d' utils/Kconfig
+          sed -i '/select BRIDGE_VLAN_FILTERING/d' utils/Kconfig
+
+          echo 'source "utils/Kconfig"' >> "Kconfig"
+          echo "CONFIG_DOCKER=y" >> arch/arm64/configs/merged_defconfig
+
+          # 显式禁用冲突特性
+          echo "# CONFIG_CFS_BANDWIDTH is not set" >> arch/arm64/configs/merged_defconfig
+          echo "# CONFIG_DOCKER_STATISTICS is not set" >> arch/arm64/configs/merged_defconfig
+          echo "# CONFIG_BLK_DEV_THROTTLING is not set" >> arch/arm64/configs/merged_defconfig
+          echo "# CONFIG_CFQ_GROUP_IOSCHED is not set" >> arch/arm64/configs/merged_defconfig
+
+          # 禁用偏执网络
+          sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' arch/arm64/configs/merged_defconfig
+          echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> arch/arm64/configs/merged_defconfig
+
+          # 修复 QVR 设备树错误
+          sed -i '/sdm845-v2-qvr-evt.dtb/d' arch/arm64/boot/dts/qcom/Makefile
+          sed -i '/qvr/d' arch/arm64/boot/dts/qcom/Makefile
+          sed -i '/interposer/d' arch/arm64/boot/dts/qcom/Makefile
+
+          # 应用 runc 补丁和 qtaguid 补丁
+          chmod +x utils/runcpatch.sh
+          if [ -f kernel/cgroup/cgroup.c ]; then
+              sh utils/runcpatch.sh kernel/cgroup/cgroup.c
+          elif [ -f kernel/cgroup.c ]; then
+              sh utils/runcpatch.sh kernel/cgroup.c
+          fi
+          if [ -f net/netfilter/xt_qtaguid.c ]; then
+              patch -p0 < utils/xt_qtaguid.patch
+          fi
+
+      # ========== KernelSU 集成 ==========
+      - name: Setup KernelSU
+        run: |
+          curl -L https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh | bash -s -- $kernelsu_remote_version
+
+      - name: Apply kernel patch
+        run: |
+          while read -r line; do
+              if [ -z "$line" ] || [[ "$line" == "#"* ]]; then
+                  continue
+              fi
+              echo "Applying kernel patch: $line"
+              git apply "this-repo/patches/$line"
+          done <<<"$kernel_patch"
+
+      - name: Apply KernelSU patch
+        run: |
+          while read -r line; do
+              if [ -z "$line" ] || [[ "$line" == "#"* ]]; then
+                  continue
+              fi
+              echo "Applying KernelSU patch: $line"
+              git apply -p2 --directory KernelSU/kernel "this-repo/patches/$line"
+          done <<<"$kernelsu_patch"
+
+      # ========== Clang 工具链 ==========
+      - name: "AOSP-Clang: Restore"
+        id: aosp_clang_restore
+        if: env.clang_type == 'aosp'
+        uses: actions/cache/restore@v4
+        with:
+          path: aosp-clang
+          key: aosp-clang-${{ env.clang_version }}
+
+      - name: "AOSP-Clang: Download"
+        id: aosp_clang_download
+        if: env.clang_type == 'aosp' && steps.aosp_clang_restore.outputs.cache-hit != 'true'
+        run: |
+          aosp_clang_branch=$(
+              case "$clang_version" in
+              r365631c ) echo android11-release;;
+              r383902b) echo master-kernel-build-2021 ;;  # <--- 添加对应分支
+              r450784e) echo master-kernel-build-2022 ;;
+              r487747c) echo main-kernel-build-2023 ;;
+              *) echo main ;;
+              esac
+          )
+          mkdir -p aosp-clang
+          curl -L https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/$aosp_clang_branch/clang-$clang_version.tar.gz | tar xz -C aosp-clang
+
+      - name: "AOSP-Clang: Save"
+        id: aosp_clang_save
+        if: env.clang_type == 'aosp' && steps.aosp_clang_download.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: aosp-clang
+          key: aosp-clang-${{ env.clang_version }}
+
+      - name: "AOSP-Clang: Setup"
+        if: env.clang_type == 'aosp'
+        run: |
+          echo PATH=$(pwd)/aosp-clang/bin:$PATH | tee -a $GITHUB_ENV
+
+      - name: "Vanilla-Clang: Setup"
+        if: env.clang_type == 'vanilla'
+        run: |
+          curl -L https://apt.llvm.org/llvm.sh | sudo bash -s -- $clang_version
+          echo PATH=/usr/lib/llvm-$clang_version/bin:$PATH | tee -a $GITHUB_ENV
+
+      # ========== 编译内核 ==========
+      - name: Export build flags
+        run: |
+          echo flags=" \
+          O=out \
+          ARCH=arm64 \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          CC='ccache clang' \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          KCFLAGS='-Wno-unknown-warning-option'
+          " | tee -a $GITHUB_ENV
+
+      - name: Make defconfig
+        run: |
+          make $flags merged_defconfig
+
+      - name: Build kernel
+        run: |
+          make $flags -j$(nproc --all)
+
+      # ========== USB/IP 模块收集 ==========
+      - name: Collect USB/IP kernel modules
+        run: |
+          mkdir -p usbip-out/modules
+          cp out/drivers/usb/usbip/*.ko usbip-out/modules/ || true
+
+      # ========== USB/IP 用户态工具编译 ==========
+      - name: Setup QEMU user static
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: Build USB/IP userspace tools (Docker)
+        run: |
+          mkdir -p usbip-out/{bin,libs}
+          docker run --rm --platform linux/arm64 \
+            --memory=4g \
+            -v ${{ github.workspace }}:/workspace \
+            -v ${{ github.workspace }}/usbip-out:/output \
+            -w /workspace \
+            arm64v8/ubuntu:22.04 \
+            bash -c "
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              ulimit -s unlimited
+              apt update
+              apt install -y \
+                build-essential \
+                autoconf \
+                libtool \
+                pkg-config \
+                libudev-dev \
+                libssl-dev \
+                flex \
+                bison \
+                file \
+                patchelf
+              cd kernel/tools/usb/usbip
+              ./autogen.sh
+              ./configure CFLAGS=\"-O0 -Wno-error\" --prefix=/usr
+              make CFLAGS=\"-O0 -Wno-error\" -j1
+              cp src/.libs/usbip /output/bin/
+              cp src/.libs/usbipd /output/bin/
+              cp libsrc/.libs/libusbip.so.0* /output/libs/
+              cd /output
+              BINARIES=\"bin/usbip bin/usbipd libs/libusbip.so.0*\"
+              DEPS=\"\"
+              for file in \$BINARIES; do
+                if [ -f \"\$file\" ]; then
+                  needed=\$(readelf -d \"\$file\" | grep NEEDED | awk '{print \$5}' | tr -d '[]' || true)
+                  for lib in \$needed; do
+                    if [[ \"\$DEPS\" != *\"\$lib\"* ]]; then
+                      DEPS=\"\$DEPS \$lib\"
+                    fi
+                  done
+                fi
+              done
+              for lib in \$(echo \$DEPS | tr ' ' '\\n' | sort -u); do
+                libpath=\$(find /lib /usr/lib -name \"\$lib\" -type f 2>/dev/null | head -1 || true)
+                if [ -n \"\$libpath\" ]; then
+                  cp -P \"\$libpath\" libs/ 2>/dev/null || cp \"\$libpath\" libs/
+                fi
+              done
+              ld_linux=\"/lib/ld-linux-aarch64.so.1\"
+              if [ -f \"\$ld_linux\" ]; then
+                cp -P \"\$ld_linux\" libs/
+              fi
+            "
+
+      - name: Package USB/IP bundle
+        run: |
+          cd usbip-out
+          tar czf ../usbip-arm64-bundle.tar.gz .
+          cd ..
+
+      - name: Upload USB/IP bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: usbip-arm64-bundle
+          path: usbip-arm64-bundle.tar.gz
+
+      # ========== 打包 AnyKernel3 ==========
+      - name: AnyKernel3 packaging
+        run: |
+          curl -Lo AnyKernel3.zip https://github.com/osm0sis/AnyKernel3/archive/refs/heads/master.zip
+          unzip AnyKernel3.zip
+          cat >AnyKernel3-master/anykernel.sh <<EOF
+          properties() { '
+          kernel.string=$kernel_repository $kernel_branch with KernelSU $kernelsu_remote_version for $device
+          do.devicecheck=1
+          do.modules=0
+          do.cleanup=1
+          do.cleanuponabort=1
+          device.name1=$device
+          '; }
+          block=auto
+          is_slot_device=auto
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          . tools/ak3-core.sh
+          split_boot
+          flash_boot
+          EOF
+          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3-master/
+          if [ -f out/arch/arm64/boot/dtbo.img ]; then
+              cp out/arch/arm64/boot/dtbo.img AnyKernel3-master/
+          fi
+          cd AnyKernel3-master
+          rm -rf .git* README.md
+          zip -r ../boot.zip *
+
+      - name: Upload boot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot
+          path: boot.zip
+
+      # ========== Release ==========
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.kernelsu_remote_version }}
+          body: |
+            Device:
+            ${{ env.device }}
+            Kernel:
+            https://github.com/${{ env.kernel_repository }}/tree/${{ env.kernel_commit_id }}
+            Branch:
+            ${{ env.kernel_branch }}
+            KernelSU:
+            https://github.com/tiann/KernelSU/releases/tag/${{ env.kernelsu_remote_version }}
+          files: |
+            boot.zip
+            usbip-arm64-bundle.tar.gz
