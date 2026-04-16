@@ -4,7 +4,7 @@ env:
   kernel_repository: Geeeeeker/android_kernel_xiaomi_sdm845
   kernel_branch: lineage-18.1
   device: dipper
-  clang_version: r383902b               # <--- 改回 Android 11 的官方版本
+  clang_version: r383902b
   defconfig: |
     arch/arm64/configs/dipper-mi845_defconfig
   kernel_patch: |
@@ -105,28 +105,22 @@ jobs:
               DEFCONFIG_FILE="$line"
           done <<<"$defconfig"
 
-      # ========== 扩展内核配置（融合自第二个工作流） ==========
+      # ========== 扩展内核配置 ==========
       - name: Apply extended kernel configs
         run: |
           DEFCONFIG="arch/arm64/configs/merged_defconfig"
-
-          # Kprobes（KernelSU 需要）
+          # Kprobes
           echo "CONFIG_KPROBES=y" >> $DEFCONFIG
           echo "CONFIG_HAVE_KPROBES=y" >> $DEFCONFIG
           echo "CONFIG_KPROBE_EVENTS=y" >> $DEFCONFIG
-
           # OverlayFS
           echo "CONFIG_OVERLAY_FS=y" >> $DEFCONFIG
-
           # 禁用 LTO
           sed -i 's/CONFIG_LTO=y/CONFIG_LTO=n/' $DEFCONFIG
           sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_CLANG=n/' $DEFCONFIG
           sed -i 's/CONFIG_THINLTO=y/CONFIG_THINLTO=n/' $DEFCONFIG
           echo "CONFIG_LTO_NONE=y" >> $DEFCONFIG
-
-          # 禁用 CC_WERROR
           echo "CONFIG_CC_WERROR=n" >> $DEFCONFIG
-
           # 其他特性
           echo "CONFIG_ASHMEM=y" >> $DEFCONFIG
           echo "CONFIG_SYSVIPC=y" >> $DEFCONFIG
@@ -140,27 +134,22 @@ jobs:
           echo "CONFIG_TMPFS=y" >> $DEFCONFIG
           echo "CONFIG_TMPFS_POSIX_ACL=y" >> $DEFCONFIG
           echo "CONFIG_TMPFS_XATTR=y" >> $DEFCONFIG
-
           # USB/IP 模块化
           echo "CONFIG_USBIP_CORE=m" >> $DEFCONFIG
           echo "CONFIG_USBIP_VHCI_HCD=m" >> $DEFCONFIG
           echo "CONFIG_USBIP_HOST=m" >> $DEFCONFIG
-
           # Backlight
           echo "CONFIG_BACKLIGHT_CLASS_DEVICE=y" >> $DEFCONFIG
           echo "CONFIG_BACKLIGHT_QCOM=y" >> $DEFCONFIG
-
-          # zstd 压缩
+          # zstd
           echo "CONFIG_ZRAM=y" >> $DEFCONFIG
           echo "CONFIG_ZRAM_DEF_COMP_ZSTD=y" >> $DEFCONFIG
           echo "CONFIG_CRYPTO_ZSTD=y" >> $DEFCONFIG
-
-          # KernelSU 基础选项
+          # KernelSU
           echo "CONFIG_KERNELSU=y" >> $DEFCONFIG
           echo "CONFIG_KPM=y" >> $DEFCONFIG
           echo "CONFIG_KALLSYMS=y" >> $DEFCONFIG
           echo "CONFIG_KALLSYMS_ALL=y" >> $DEFCONFIG
-
           # 禁用 MODVERSIONS
           sed -i 's/CONFIG_MODVERSIONS=y/# CONFIG_MODVERSIONS is not set/' $DEFCONFIG
           echo "# CONFIG_MODVERSIONS is not set" >> $DEFCONFIG
@@ -170,32 +159,22 @@ jobs:
         run: |
           rm -rf utils
           git clone https://github.com/tomxi1997/lxc-docker-support-for-android.git utils
-          # 移除强制选中的越权选项
           sed -i '/select CFS_BANDWIDTH/d' utils/Kconfig
           sed -i '/select DOCKER_STATISTICS/d' utils/Kconfig
           sed -i '/select BLK_DEV_THROTTLING/d' utils/Kconfig
           sed -i '/select CFQ_GROUP_IOSCHED/d' utils/Kconfig
           sed -i '/select BRIDGE_VLAN_FILTERING/d' utils/Kconfig
-
           echo 'source "utils/Kconfig"' >> "Kconfig"
           echo "CONFIG_DOCKER=y" >> arch/arm64/configs/merged_defconfig
-
-          # 显式禁用冲突特性
           echo "# CONFIG_CFS_BANDWIDTH is not set" >> arch/arm64/configs/merged_defconfig
           echo "# CONFIG_DOCKER_STATISTICS is not set" >> arch/arm64/configs/merged_defconfig
           echo "# CONFIG_BLK_DEV_THROTTLING is not set" >> arch/arm64/configs/merged_defconfig
           echo "# CONFIG_CFQ_GROUP_IOSCHED is not set" >> arch/arm64/configs/merged_defconfig
-
-          # 禁用偏执网络
           sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' arch/arm64/configs/merged_defconfig
           echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> arch/arm64/configs/merged_defconfig
-
-          # 修复 QVR 设备树错误
           sed -i '/sdm845-v2-qvr-evt.dtb/d' arch/arm64/boot/dts/qcom/Makefile
           sed -i '/qvr/d' arch/arm64/boot/dts/qcom/Makefile
           sed -i '/interposer/d' arch/arm64/boot/dts/qcom/Makefile
-
-          # 应用 runc 补丁和 qtaguid 补丁
           chmod +x utils/runcpatch.sh
           if [ -f kernel/cgroup/cgroup.c ]; then
               sh utils/runcpatch.sh kernel/cgroup/cgroup.c
@@ -231,7 +210,7 @@ jobs:
               git apply -p2 --directory KernelSU/kernel "this-repo/patches/$line"
           done <<<"$kernelsu_patch"
 
-      # ========== Clang 工具链 ==========
+      # ========== Clang 工具链（使用固定链接） ==========
       - name: "AOSP-Clang: Restore"
         id: aosp_clang_restore
         if: env.clang_type == 'aosp'
@@ -244,17 +223,9 @@ jobs:
         id: aosp_clang_download
         if: env.clang_type == 'aosp' && steps.aosp_clang_restore.outputs.cache-hit != 'true'
         run: |
-          aosp_clang_branch=$(
-              case "$clang_version" in
-              r365631c ) echo android11-release;;
-              r383902b) echo master-kernel-build-2021 ;;  # <--- 添加对应分支
-              r450784e) echo master-kernel-build-2022 ;;
-              r487747c) echo main-kernel-build-2023 ;;
-              *) echo main ;;
-              esac
-          )
           mkdir -p aosp-clang
-          curl -L https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/$aosp_clang_branch/clang-$clang_version.tar.gz | tar xz -C aosp-clang
+          # 使用您预先上传的稳定链接（确保 clang_version 与文件名匹配）
+          curl -LSs "https://github.com/Geeeeeker/boot/releases/download/clang-prebuilts-20260319-031015/clang-${clang_version}.tar.gz" | tar xz -C aosp-clang
 
       - name: "AOSP-Clang: Save"
         id: aosp_clang_save
